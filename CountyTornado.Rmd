@@ -1,0 +1,1986 @@
+Statistical Models for Regional Tornado Studies
+===============================================
+
+## James B. Elsner, Thomas H. Jagger, and Holly M. Widen
+
+```{r, echo=FALSE}
+slibrary <- function(...) suppressMessages(library(...))
+slibrary(httr)
+slibrary(moments)
+slibrary(magrittr) #For Tom... needs to update dplyr
+slibrary(raster)
+slibrary(spdep)
+slibrary(splines)
+slibrary(reshape2)
+slibrary(RColorBrewer)
+slibrary(wesanderson)
+#source("http://www.math.ntnu.no/inla/givemeINLA.R")
+slibrary(INLA)
+#inla.update(testing = TRUE)
+#inla.version()
+useDrop <- function(x, use.fun = source, ...){
+                    tf <- tempfile()
+                    tmp <- GET(x)
+                    stop_for_status(tmp)
+                    writeBin(content(tmp, type = "raw"), tf)
+                    use.fun(tf, ...)
+                    }
+source("CountyStatisticsSupport.R")
+slibrary(dplyr)
+```
+
+### Tornado Data
+
+The model is built using data from the SPC tornado dataset.
+```{r eval=FALSE}
+download.file("http://www.spc.noaa.gov/gis/svrgis/zipped/tornado.zip",
+              "tornado.zip", mode = "wb")
+```
+```{r}
+
+unzip("tornado.zip",exdir="./tmp")
+TornL = changeTornDataTypes(readOGR(dsn = "./tmp", layer = "tornado", 
+                                    stringsAsFactors = FALSE))
+```
+
+### Boundaries
+
+Get administrative boundaries. https://www.census.gov/geo/maps-data/data/cbf/cbf_counties.html. The 20m = 1:20,000,000 low resolution boundaries. Here we use the 5m = 1:5,000,000.
+```{r, eval=FALSE}
+download.file("http://www2.census.gov/geo/tiger/GENZ2013/cb_2013_us_county_5m.zip",
+              "cb_2013_us_county_5m.zip", mode = "wb")
+```
+```{r}
+unzip("cb_2013_us_county_5m.zip",exdir="./tmp")
+US.sp = readOGR(dsn = "./tmp", layer = "cb_2013_us_county_5m", 
+                                    stringsAsFactors = FALSE)
+```
+
+Extract Kansas using the state Federal Information Processing Standard (FIPS).
+```{r}
+FP = 20
+AB = "KS"
+ST.sp = US.sp[US.sp$STATEFP == FP, ]
+nrow(ST.sp)
+county = paste(ST.sp$STATEFP, ST.sp$COUNTYFP, sep = "")
+countiesun.sp = geometry(spChFIDs(ST.sp, county)) 
+counties.sp = spTransform(countiesun.sp, CRS(proj4string(TornL)))
+rgeos::gArea(counties.sp) / 10^6
+```
+
+### Elevation Data
+
+```{r, eval=FALSE}
+download.file(url = "http://www.viewfinderpanoramas.org/DEM/TIF15/15-H.zip",
+              destfile = "15-H.ZIP", mode = "wb")
+```
+```{r}
+unzip("15-H.ZIP",exdir="./tmp")
+Elev = raster("./tmp/15-H.tif")
+Elev1 = as(crop(Elev, extent(countiesun.sp)), "SpatialGridDataFrame")
+proj4string(Elev1) = proj4string(countiesun.sp) #same projection, different datum & ellipsoid
+state.sp = unionSpatialPolygons(countiesun.sp, 
+                             ID = rep("1", length(row.names(countiesun.sp))))
+Elev2 = Elev1[state.sp, ]
+range(Elev2$X15.H, na.rm = TRUE)
+```
+
+### County Warning Areas
+
+```{r}
+L="http://www.nws.noaa.gov/geodata/catalog/wsom/data/bp03de14.dbx"
+L="bp03de14.dbx"
+CWA = read.table(L, sep = "|", quote = "", colClasses = "character")
+cwa.df = data.frame(county = CWA$V7[CWA$V7 %in% county], 
+                    cwa = CWA$V3[CWA$V7 %in% county])
+table(cwa.df$cwa)
+```
+
+County map with terrain and CWA definitions.
+```{r Fig1, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+terrain = div_gradient_pal(low = muted("blue"), 
+                            mid = "white", 
+                            high = muted("orange"), 
+                            space = "rgb")(seq(0, 1, length = 104))
+t1 = list("sp.lines", as(countiesun.sp, "SpatialLines"), col = "white")
+centers = as.data.frame(coordinates(countiesun.sp))
+centers$county = row.names(centers)
+centers2 = merge(centers, cwa.df, by = "county")
+l = list("sp.text", as.matrix(centers2[, 2:3]), centers2$cwa,
+          col = "black", cex = .6)
+spplot(Elev2, col.regions = terrain,
+       scales = list(draw = TRUE),
+       at = seq(211, 1230, length = 104),
+       sp.layout = list(t1, l),
+       colorkey = list(space = "bottom"),
+       par.settings = list(axis.line = list(col = NA)),
+       sub = "Elevation (m)")
+```
+
+### County Population Data
+
+Use the population estimates from the Census Bureau from 1970-2012 see http://www.nber.org/data/census-intercensal-county-population.html. Use the 2012 value for 2013.
+```{r}
+L = "county_population.csv"
+pop0a = read.csv(L)
+pop0 = subset(pop0a, state_fips == FP)
+pop0$pop2013 = pop0$pop2012
+pop0$pop2013[1]
+pop0$county = as.character(pop0$fips)
+pop1 = pop0[-1, -(1:10)]
+Pop.df = melt(pop1, id.vars = "county")
+Pop.df$Year = as.numeric(substring(Pop.df$variable, first = 4, last = 7))
+names(Pop.df)[3:4] = c("pop", "Year")
+Pop.df$lpop = log10(Pop.df$pop)
+Pop.df$ID = match(Pop.df$county, county) #generate spatial ID
+Pop.df = Pop.df[order(Pop.df$ID), ] #order by spatial ID
+```
+
+Population changes by county.
+```{r Fig2, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+PC = Pop.df %>%
+  group_by(ID) %>%
+  summarize(Change = (pop[Year == max(Year)] - pop[Year == min(Year)])/pop[Year == max(Year)] * 100)
+PC.df = as.data.frame(PC)
+row.names(PC.df) = county
+spdf = SpatialPolygonsDataFrame(counties.sp, PC.df)
+spdf$Name = ST.sp$NAME
+area = rgeos::gArea(counties.sp, byid = TRUE)
+spdf$area = area
+range(spdf$Change)
+rng = seq(-125, 125, 25)
+crq = brewer.pal(10, "BrBG")
+l = list("sp.text", coordinates(spdf), spdf$Name,
+          col = "black", cex = .6)
+spplot(spdf, "Change", col = "white", at = rng, 
+       col.regions = crq,
+       colorkey = list(space = "bottom", labels = paste(rng)),
+       sp.layout = list(l),
+       par.settings = list(axis.line = list(col = NA)),
+       sub = "% Population Change (1970 to 2012)")
+```
+
+Latest population values by county are needed for correlation and choropleth. The log of the population density is the common log.
+```{r Fig3, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+poplatest = subset(Pop.df, Year == max(Year))
+spdf$pop = poplatest$pop
+spdf$Lpop = log10(spdf$pop)
+spdf$density = spdf$pop/spdf$area * 10^6
+spdf$Ldensity = log10(spdf$density)
+range(spdf$Ldensity)
+rng = seq(-.2, 2.8, .6)
+crq = brewer.pal(6, "Blues")
+labs = as.character(round(10^rng, 0))
+spplot(spdf, "Ldensity", col = "white", at = rng, 
+       col.regions = crq,
+       colorkey = list(space = "bottom", labels = labs),
+       sp.layout = list(l),
+       par.settings = list(axis.line = list(col = NA)),
+       sub = "2012 Population Density [persons per square km]")
+sort(spdf$density, decreasing = TRUE)[1:3]
+```
+
+### Subset tornado data
+
+Only EF1+ tornadoes since 1970. Overlay tornado tracks on boundaries. Each element of the list is a county subset of the tornado track file. The data frame nTor.df contains the per-county tornado count, area, and rate.
+
+The TracksAll.df data frame contains the tornado track attributes listed by county. Track information is repeated for each county in cases where the track intersects more than one county. 
+```{r}
+TornL2 = subset(TornL, Year >= 1970 & EF >= 1)
+ct = over(counties.sp, TornL2, returnList = TRUE)
+names(ct) = county
+nT = sapply(ct, function(x) nrow(x))
+nTd = sapply(ct, function(x) length(unique(x$Date)))
+Nyears = diff(range(TornL2$Year)) + 1
+nTor.df = data.frame(state = AB, county = county, Nyears =  Nyears,
+                     nT = nT, area = area/1000000, 
+                     nTd = nTd,
+                     rate = nT/area * 10^6 * 10000 / Nyears,
+                     stringsAsFactors = FALSE, ID = 1:length(county))
+spdf$state = AB
+spdf$county = county
+spdf$Nyears = nTor.df$Nyears
+spdf$nT = nTor.df$nT
+spdf$nTd = nTor.df$nTd
+spdf$area = nTor.df$area
+spdf$rate = nTor.df$rate
+TracksAll.df = ldply(ct, data.frame)
+colnames(TracksAll.df)[1] = "county"
+cor.test(spdf$nT, spdf$area, conf.level = .9)
+cor.test(spdf$nT, spdf$pop, conf.level = .9)
+```
+
+Area is now given in square km. Rate is tornadoes per sq m per 10,000 years. The most counties affected by a single tornado is `r I(max(table(TracksAll.df$SeqID)))`.  
+
+### Annual Counts by County
+
+The data frame nTor.year is the number of tornadoes affecting the state by year.
+```{r}
+nTor.year = TracksAll.df %>%
+  filter(!duplicated(SeqID)) %>%
+  group_by(Year) %>%
+  summarize(nT = n())
+nTor.year = as.data.frame(nTor.year)
+nTor.year$Year2 = nTor.year$Year
+sum(nTor.year$nT)
+```
+
+```{r, eval=FALSE}
+ggplot(nTor.year[nTor.year$Year > 1996, ], aes(x = factor(Year), y = nT)) + 
+  geom_bar(stat = 'identity', fill = "gray") +
+  geom_text(aes(label = nT), vjust = -.5, size = 2, color = "darkblue") +
+  xlab("Year") + ylab("Annual Number of EF1+ Tornadoes in Kansas\nSince the Release of the Movie Twister in 1996") +
+  theme(axis.text.x  = element_text(size = 11), 
+        legend.position = "none")
+```
+
+The data frame nTor.day0 contains the tornado county and tornado day county by year and county.
+```{r}
+nTor.day0 = ddply(TracksAll.df, .(county, Year), summarize, 
+                  nT = length(county), 
+                  nTd = length(unique(Date)), .drop = FALSE)
+nTor.day = merge(nTor.df[c("state", "county", "area", "ID")],
+                 nTor.day0)
+```
+
+Choropleth map of tornado counts & tornado days.
+```{r, eval=FALSE}
+crq = wes.palette(name = "Zissou", type = "continuous")
+range(spdf$nT)
+rng = seq(0, 30, 5)
+spplot(spdf, "nT", col = "white", at = rng, 
+       col.regions = crq(8),
+       colorkey = list(space = "bottom", labels = paste(rng)),
+       par.settings = list(axis.line = list(col = NA)),
+       sub = "Number of EF1+ Tornadoes (1970-2013)")
+
+crq = brewer.pal(5, "GnBu")
+range(spdf$nTd)
+rng = seq(0, 20, 4)
+spplot(spdf, "nTd", col = "white", at = rng, 
+       col.regions = crq,
+       colorkey = list(space = "bottom", labels = paste(rng)),
+       par.settings = list(axis.line = list(col = NA)),
+       sub = "Number of EF1+ Tornado Days (1970-2013)")
+```
+
+A function to plot tracks and county counts using ggmap.
+```{r, echo=FALSE}
+plotTorn <- function(x, tracks){
+  CRS0 = CRS("+proj=longlat +datum=WGS84")
+  #x is the spatial polygons object
+  #tracks is the track file for each polygon.
+  bc = getBordersAndCenters(x, CRS0)
+  bc$centers$nT = x$nT
+  bc$centers$rate = round(x$rate, 2)
+  borders.df = merge(bc$centers[c("county", "nT", "rate")], 
+                     bc$borders, by = "county")
+  #generate choropleth map
+  mapT = ggplot(borders.df, aes(x = long, y = lat, group = county, 
+                                order = order, fill = nT)) +
+    geom_polygon(colour = "gray", size = .2) +
+    coord_map(project="polyconic") + 
+    theme(panel.grid.minor=element_blank(), 
+          panel.grid.major=element_blank(), 
+          panel.background=element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          legend.position = "bottom") +
+    xlab("") + ylab("") +
+    geom_text(data = bc$centers, aes(x = long, y = lat, group = NULL, 
+                                     order = NULL, label = nT), 
+              vjust = .5, size = 3, color = "white")
+  #generate the tracks data from the track.df file 
+  tracks = tracks[!duplicated(tracks$OM), ]
+  tracks = subset(tracks, ELAT != 0)
+  mapT +
+    geom_segment(aes(x = SLON, xend = ELON, y = SLAT, yend = ELAT, 
+                     group = NULL, order = NULL, fill = NULL),
+                 data = tracks, lineend = "round",
+                 color = "black", size = 1.5, alpha = .6) +
+    geom_text(data=bc$centers, aes(x = long, y = lat, group = NULL, 
+                                   order = NULL, label = nT), 
+              vjust = .5, size = 3, color = "white") +
+    theme(plot.title = element_text(vjust = 0,
+                                  hjust = 0,
+                                  size = 15))
+}
+```
+```{r Fig4, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+crq = wes.palette(name = "Zissou", type = "continuous")
+plotTorn(x = spdf, tracks = TracksAll.df) +
+  scale_fill_gradientn("EF1+\nTornado Reports\n(1970-2013)", 
+                       colours = crq(10))
+```
+
+On average the larger counties have more tornadoes.
+
+Merge tornado and population data.
+```{r}
+popNtor = merge(Pop.df, nTor.day, all = FALSE)
+popNtor$density = with(popNtor, pop/area)
+popNtor$Ldensity = log2(popNtor$density)
+popNtor$Year2 = popNtor$Year
+```
+
+Additional year column (Year2) needed for the models.
+
+### Trends in statewide tornado counts
+
+Regress tornado counts on year. First with Year as a fixed covariate then with Year as a second order random walk term of the form
+
+$$x[i] - 2 x[i-1] + x[i-2] \sim \mathcal{N}(0,\tau^{-1})$$
+
+Some global controls for INLA. Use as needed.
+```{r}
+control = list(
+  predictor = list(compute = TRUE),
+  inla = list(strategy = "laplace", 
+              fast = FALSE,
+              stencil = 7,
+              npoints = 198,
+              int.strategy = "grid", 
+              dz = .5),
+  results = list(return.marginals.random = TRUE),
+  compute = list(config = TRUE, mlik = TRUE, cpo = TRUE, dic = TRUE, po = TRUE),
+  family = list(variant = 1, hyper = list(theta = list(prior = "loggamma", param = c(1, 1)))))
+```
+
+Linear Trend (%/yr)
+```{r}
+formula = nT ~ Year
+modelt0 = inla(formula = formula, 
+               family = "nbinomial", 
+               quantiles = c(.05, .5, .95), 
+               data = nTor.year,
+               control.compute = control$compute,
+               control.predictor = control$predictor)
+TM = modelt0$summary.fixed$mean[2]
+TL = modelt0$summary.fixed$'0.05quant'[2]
+TH = modelt0$summary.fixed$'0.95quant'[2]
+(exp(TM) - 1) * 100
+(exp(TL) - 1) * 100
+(exp(TH) - 1) * 100
+```
+
+Nonlinear trend
+```{r Fig5, dev=c('png','pdf'), fig.height=4, fig.width=6, fig.path='figure/', fig.keep='all'}
+formula = nT ~ Year + f(Year2, model = "rw2")
+modelt1 = inla(formula = formula, 
+             family = "nbinomial", 
+             quantiles = c(.05, .5, .95), 
+             data = nTor.year,
+             control.compute = control$compute,
+             control.predictor = control$predictor)
+out = data.frame(Year = nTor.year$Year,
+                 QL = modelt1$summary.fitted.values$"0.05quant",
+                 QM = modelt1$summary.fitted.values$"0.5quant",
+                 QH = modelt1$summary.fitted.values$"0.95quant",
+                 nT = nTor.year$nT,
+                 ST = "Kansas")
+ggplot(out, aes(x = Year, y = QM)) +
+  geom_line(color = 'blue') +
+  geom_ribbon(aes(x = Year, ymax = QH, ymin = QL), color = "gray", alpha = .25) +
+  geom_point(aes(x = Year, y = nT)) +
+  ylab("Number of EF1+ Tornadoes") +
+  theme_bw()
+```
+
+Test Anderson-Darling on PIT and the log score.
+```{r}
+goftest::ad.test(modelt0$cpo$pit)
+goftest::ad.test(modelt1$cpo$pit)
+mean(-log(modelt0$cpo$cpo))
+mean(-log(modelt1$cpo$cpo))
+```
+
+### Models for county-level tornado counts
+
+Spatial neighborhood definition as an inla graph
+```{r}
+nb = poly2nb(spdf)
+nb2INLA("tornb.inla", nb)
+tornb.inla = inla.read.graph("tornb.inla")
+```
+
+The area times the Nyears indicates the square meter years exposed to tornadoes (E). Scale the exposure to have a mean of unity. The model has a spatial id. E is scaled to have a mean of one. constr = constant rate. The DIC measures how well the model fits the data; the larger this is, the worse the fit. Year is centered on 1991.
+
+Model with spatial term. Determine the model that results in the lowest DIC. Then compare this model with a model where the spatial term is removed.
+```{r}
+formula = nT ~ f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+             data = popNtor,
+             quantiles = c(.05, .5, .95),
+             control.compute = control$compute,
+             control.predictor = control$predictor,
+             control.results = control$results,
+             control.family = control$family
+             )
+summary(model)
+```
+
+Model w/out spatial term
+```{r}
+formula0 = nT ~ Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+                f(Year2, model = "iid")
+model0 = inla(formula = formula0, family = "nbinomial", E = area/2000,
+              data = popNtor,
+              quantiles = c(.05, .5, .95),
+              control.compute = control$compute,
+              control.predictor = control$predictor,
+              control.results = control$results,
+              control.family = control$family
+              )
+summary(model0)
+```
+
+Model diagnostics. The predictive quality of the model is assessed by the cross-validated log score. A smaller value of the score indicates better prediction quality (Gneiting and Raftery 2007).
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+```
+
+Brier score
+```{r}
+brier.score <- function(x, m){
+  with(m, {mean(x^2) - 2 * mean(x * mean) + mean(mean^2 + sd^2)})
+}
+brier.score(popNtor[["nT"]], model[["summary.fitted.values"]])
+```
+
+Test case for PIT
+```{r, eval=FALSE, echo=FALSE}
+x = model$cpo$pit
+w = rnbinom(length(x), size = .4, mu = exp(x))
+tmp = data.frame(y = w, x = x)
+tmpm = inla(formula = y ~ x,
+            family = "nbinomial",
+            data = tmp,
+            control.compute = list(cpo = TRUE))
+goftest::ad.test(tmpm$cpo$pit)
+u = pnbinom(w, size = .4, mu = exp(x))
+goftest::ad.test(u)
+v = u - runif(length(w)) * dnbinom(w, size = .4, mu = exp(x))
+goftest::ad.test(v)
+```
+
+```{r}
+ggplot() + 
+  geom_histogram(aes(x = modPIT), color = "white",
+                 fill = "grey", binwidth = .05) + 
+  xlab("Probability") +
+  ylab("Frequency") +
+  ggtitle("Distribution of modified PIT") #looks good!
+```
+
+The spatial random term by region (county) is given in the data frame model$summary.random$ID.
+
+```{r}
+spdf$RandomMean = model$summary.random$ID$mean
+spdf$RandomQ50 = model$summary.random$ID$'0.5quant'
+spdf$sd = model$summary.random$ID$sd
+df = model$summary.random$ID
+names(df) = c("ID", "mean", "sd", "QL", "QM", "QH", "mode", "kld")
+df$QL = (exp(df$QL) - 1) * 100
+df$QM = (exp(df$QM) - 1) * 100
+df$QH = (exp(df$QH) - 1) * 100
+df$Sig = sign(df$QL) == sign(df$QH)
+table(df$Sig)
+spdf$Sig = df$Sig
+```
+
+Plot function for the random-effect term.
+```{r, echo=FALSE}
+ggplotSpdata <- function(x, field, tfun = function(x) I(x), 
+                         color = muted("yellow", l = 50, c = 80)){
+  CRS0 = CRS("+proj=longlat +datum=WGS84")
+  bc = getBordersAndCenters(x, CRS0)
+  bc$centers$newfield = tfun(x[[field]])
+  borders.df = merge(bc$borders, bc$centers[c("county", "newfield")], by = "county")
+  mapO = ggplot(borders.df, aes(x = long, y = lat, group = group, fill = newfield)) +
+    geom_polygon(colour = "gray", size = .2) +
+    coord_map(project = "polyconic") + 
+    theme(panel.grid.minor = element_blank(), 
+          panel.grid.major = element_blank(), 
+          panel.background = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          legend.position = "bottom") +
+    xlab("") + ylab("") +
+    geom_text(data = bc$centers, 
+              aes(x = long, y = lat, group = NULL, label = newfield), 
+              vjust = .5, size = 3, color = color)
+    mapO
+}
+```
+
+```{r Fig6, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[5] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+ggplotSpdata(spdf, "RandomQ50", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Tornado Occurrence\n[% of State Avg]", 
+            low = muted("blue"), mid = "white", high = muted("red"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+  geom_polygon(data = borders2.df[borders2.df$newfield > 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("red"), size = 2) +
+  geom_polygon(data = borders2.df[borders2.df$newfield < 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("blue"), size = 2) +
+  geom_text(data = df3[df3$Sig,], 
+              aes(x = long, y = lat, group = NULL, label = round(newfield)), 
+              vjust = .5, size = 3, color = 'black')
+```
+
+Marginal standard deviations
+```{r Fig7, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[3] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+ggplotSpdata(spdf, "sd", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Random Effect S.D.\n[% of State Avg]", 
+            low = muted("yellow"), mid = "white", high = muted("green"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+    geom_text(data = df3, 
+              aes(x = long, y = lat, group = NULL, label = round((exp(newfield) - 1) * 100)), 
+              vjust = .5, size = 3, color = 'white')
+```
+
+Marginal s.d. tend to be lower (precision higher) in interior counties having a larger number of neighbors.
+
+Diagnostic plots.
+```{r, eval=FALSE}
+plot(model)
+```
+
+### Surface roughness and low-level inflow hypothesis
+
+```{r}
+Elev.data = over(countiesun.sp, Elev1, returnList = TRUE)
+Elev.df = data.frame(county = rep(county, sapply(Elev.data, nrow)),
+                     Elev = unlist(Elev.data), 
+                     ID = rep(spdf$ID, sapply(Elev.data, nrow)),
+                     stringsAsFactors = FALSE)
+t.test(Elev.df$Elev, conf.level = .9)
+CE.df = Elev.df %>%
+  group_by(ID) %>%
+  summarize(elev = mean(Elev, na.rm = TRUE),
+            elevS = sd(Elev, na.rm = TRUE),
+            elevK = kurtosis(Elev, na.rm = TRUE),
+            elevCV = elevS/elev)
+all(spdf$ID == CE.df$ID)
+spdf@data[colnames(CE.df)] = CE.df
+popNtor2 = merge(popNtor, CE.df, by = "ID")
+cor.test(spdf$nT, spdf$elevS, conf.level = .9)
+```
+
+```{r, eval=FALSE}
+range(spdf$elevS)
+rng = seq(10, 80, 10)
+crq = brewer.pal(7, "YlOrBr")
+spplot(spdf, "elevS", col = "white", at = rng, 
+       col.regions = crq,
+       colorkey = list(space = "bottom"),
+       par.settings = list(axis.line = list(col = NA)),
+       sub = "Elevation S.D.[m]")
+```
+
+Function for plotting the density of the marginal term.
+```{r, echo=FALSE}
+ggplotmargin <- function(x, type, effect, xlab, ylab = expression(Posterior~~Density),
+                         int.value = c(value = 0, 5, 95),
+                         color = c("red", "gray", "gray")){
+xx = as.data.frame(inla.smarginal(x[[paste("marginals", type, sep=".")]][[effect]]))
+  out = ggplot(xx, aes(x, y)) + geom_line() + ylab(ylab) + xlab(xlab)    
+if(length(int.value) == 0) int.value = 0
+int.value = lapply(int.value, function(x) if(is.character(x)) 
+  type.convert(x, as.is = TRUE) else x)
+int.value = lapply(int.value, function(x) if(is.character(x)) 
+  lapply(strsplit(x, "=")[[1]], type.convert, as.is = TRUE) else x)
+nx = names(int.value)
+if(!is.null(nx))
+   for(i in which(nx != ""))  int.value[[i]] = list(nx[i], int.value[[i]])
+    int.value = sapply(int.value, function(x) {
+                      if(is.numeric(x)) xx$x[which.max(cumsum(xx$y)/sum(xx$y) >= as.numeric(x/100))]
+                      else switch(x[[1]], 
+                      mean = sum(xx$y*xx$x)/sum(xx$y), 
+                      median = xx$x[which.max(cumsum(xx$y)/sum(xx$y) >=.5)],
+                      mode = xx$x[which.max(xx$y)],
+                      value = x[[2]],
+                      zero = 0)})
+
+if(length(color) <= length(int.value)) color = rep(color, length = length(int.value))
+for(i in length(int.value):1) out = out + geom_vline(xintercept = int.value[i], color = color[i]) 
+out
+}
+```
+
+```{r Fig9, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+formula = nT ~ elevS +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+                Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+                f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+             data = popNtor2,
+             quantiles = c(.05, .5, .95),
+             control.compute = control$compute,
+             control.predictor = control$predictor,
+             control.results = control$results,
+             control.family = control$family
+             )
+summary(model)
+spdf$RandomMean = model$summary.random$ID$mean
+spdf$RandomQ50 = model$summary.random$ID$'0.5quant'
+spdf$sd = model$summary.random$ID$sd
+df = model$summary.random$ID
+names(df) = c("ID", "mean", "sd", "QL", "QM", "QH", "mode", "kld")
+df$QL = (exp(df$QL) - 1) * 100
+df$QM = (exp(df$QM) - 1) * 100
+df$QH = (exp(df$QH) - 1) * 100
+df$Sig = sign(df$QL) == sign(df$QH)
+table(df$Sig)
+spdf$Sig = df$Sig
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[5] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+ggplotSpdata(spdf, "RandomQ50", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Tornado Occurrence\n[% of State Avg]", 
+            low = muted("blue"), mid = "white", high = muted("red"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+  geom_polygon(data = borders2.df[borders2.df$newfield > 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("red"), size = 2) +
+  geom_polygon(data = borders2.df[borders2.df$newfield < 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("blue"), size = 2) +
+  geom_text(data = df3[df3$Sig,], 
+              aes(x = long, y = lat, group = NULL, label = round(newfield)), 
+              vjust = .5, size = 3, color = 'black')
+```
+
+Model diagnostics
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+```
+
+```{r Fig8, dev=c('png','pdf'), fig.height=4, fig.width=6, fig.path='figure/', fig.keep='all'}
+ggplotmargin(model, type = "fixed", effect = "elevS", xlab = "") +  
+  xlab(expression("Elevation S.D. Coefficient"~"["*m^{-1}*"]"))
+```
+
+### County warning area as a significant factor
+
+```{r}
+cwa.df$DDC = cwa.df$cwa == "DDC"
+cwa.df$GLD = cwa.df$cwa == "GLD"
+cwa.df$GID = cwa.df$cwa == "GID"
+cwa.df$TOP = cwa.df$cwa == "TOP"
+cwa.df$ICT = cwa.df$cwa == "ICT"
+cwa.df$EAX = cwa.df$cwa == "EAX"
+cwa.df$SGF = cwa.df$cwa == "SGF"
+popNtor3 = merge(popNtor2, cwa.df, by = "county")
+```
+
+```{r}
+formula = nT ~ elevS + I(DDC + GID) + 
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+             data = popNtor3,
+             quantiles = c(.05, .5, .95),
+             control.compute = control$compute,
+             control.predictor = control$predictor,
+             control.results = control$results,
+             control.family = control$family
+              )
+summary(model)
+```
+
+Model diagnostics
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+brier.score(popNtor[["nT"]], model[["summary.fitted.values"]])
+```
+
+Test of major highway or not in the county. U.S. highway or interstate.
+```{r}
+hiWays = read.table("MajorHiWays_KS.txt", header = TRUE,
+                    stringsAsFactors = FALSE)
+hiWays$county = as.character(hiWays$county)
+popNtor4 = merge(popNtor3, hiWays, by = "county")
+```
+
+```{r}
+formula = nT ~ elevS + DDC + GID + highway +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity * I(Year - 1991) + 
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+             data = popNtor4,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+### Illinois
+
+Borders
+```{r}
+FP = 17
+AB = "IL"
+ST.sp = US.sp[US.sp$STATEFP == FP, ]
+nrow(ST.sp)
+county = paste(ST.sp$STATEFP, ST.sp$COUNTYFP, sep = "")
+countiesun.sp = geometry(spChFIDs(ST.sp, county)) 
+counties.sp = spTransform(countiesun.sp, CRS(proj4string(TornL)))
+rgeos::gArea(counties.sp) / 10^6
+```
+
+Elevation
+```{r}
+Elev1 = as(crop(Elev, extent(countiesun.sp)), "SpatialGridDataFrame")
+proj4string(Elev1) = proj4string(countiesun.sp) #same projection, different datum & ellipsoid
+```
+
+CWA
+```{r}
+cwa.df = data.frame(county = CWA$V7[CWA$V7 %in% county], 
+                    cwa = CWA$V3[CWA$V7 %in% county])
+```
+
+Population
+```{r}
+pop0 = subset(pop0a, state_fips == FP)
+pop0$pop2013 = pop0$pop2012
+pop0$pop2013[1]
+pop0$county = as.character(pop0$fips)
+pop1 = pop0[-1, -(1:10)]
+Pop.df = melt(pop1, id.vars = "county")
+Pop.df$Year = as.numeric(substring(Pop.df$variable, first = 4, last = 7))
+names(Pop.df)[3:4] = c("pop", "Year")
+Pop.df$lpop = log10(Pop.df$pop)
+Pop.df$ID = match(Pop.df$county, county) #generate spatial ID
+Pop.df = Pop.df[order(Pop.df$ID), ]
+PC = Pop.df %>%
+  group_by(ID) %>%
+  summarize(Change = (pop[Year == max(Year)] - pop[Year == min(Year)])/pop[Year == max(Year)] * 100)
+PC.df = as.data.frame(PC)
+row.names(PC.df) = county
+spdf = SpatialPolygonsDataFrame(counties.sp, PC.df)
+spdf$Name = ST.sp$NAME
+area = rgeos::gArea(counties.sp, byid = TRUE)
+spdf$area = area
+poplatest = subset(Pop.df, Year == max(Year))
+spdf$pop = poplatest$pop
+spdf$Lpop = log10(spdf$pop)
+spdf$density = spdf$pop/spdf$area * 10^6
+spdf$Ldensity = log10(spdf$density)
+```
+
+Tornadoes
+```{r}
+ct = over(counties.sp, TornL2, returnList = TRUE)
+names(ct) = county
+nT = sapply(ct, function(x) nrow(x))
+Nyears = diff(range(TornL2$Year)) + 1
+nTor.df = data.frame(state = AB, county = county, Nyears =  Nyears,
+                     nT = nT, area = area/1000000, 
+                     rate = nT/area * 10^6 * 10000 / Nyears,
+                     stringsAsFactors = FALSE, ID = 1:length(county))
+spdf$state = AB
+spdf$county = county
+spdf$Nyears = nTor.df$Nyears
+spdf$nT = nTor.df$nT
+spdf$area = nTor.df$area
+spdf$rate = nTor.df$rate
+TracksAll.df = ldply(ct, data.frame)
+colnames(TracksAll.df)[1] = "county"
+cor.test(spdf$nT, spdf$area, conf.level = .9)
+cor.test(spdf$nT, spdf$pop, conf.level = .9)
+nTor.year = TracksAll.df %>%
+  filter(!duplicated(SeqID)) %>%
+  group_by(Year) %>%
+  summarize(nT = n())
+nTor.year = as.data.frame(nTor.year)
+nTor.year$Year2 = nTor.year$Year
+sum(nTor.year$nT)
+nTor.day0 = ddply(TracksAll.df, .(county, Year), summarize, 
+                  nT = length(county), 
+                  nTd = length(unique(Date)), .drop = FALSE)
+nTor.day = merge(nTor.df[c("state", "county", "area", "ID")],
+                 nTor.day0)
+popNtor = merge(Pop.df, nTor.day, all = FALSE)
+popNtor$density = with(popNtor, pop/area)
+popNtor$Ldensity = log2(popNtor$density)
+popNtor$Year2 = popNtor$Year
+```
+
+Raw counts and tracks
+```{r}
+p4s = "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40.07 +lon_0=-89.2 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+spdf = spTransform(spdf, CRS(p4s))
+crq = wes.palette(name = "Zissou", type = "continuous")
+p1IL = plotTorn(x = spdf, tracks = TracksAll.df) +
+         scale_fill_gradientn("EF1+\nTornado Reports\n(1970-2013)", 
+                              colours = crq(10))
+#crq = wes.palette(name = "Zissou", type = "continuous")
+#range(spdf$nT)
+#rng = seq(0, 40, 5)
+#p1IL = spplot(spdf, "nT", col = "white", at = rng, 
+#         col.regions = crq(8),
+#         colorkey = list(space = "bottom", labels = paste(rng)),
+#         par.settings = list(axis.line = list(col = NA)),
+#         sub = "EF1+ Tornado Reports (1970-2013)")
+```
+
+Linear Trend (%/yr)
+```{r}
+formula = nT ~ Year
+model = inla(formula = formula, 
+                 family = "nbinomial", 
+                 quantiles = c(.05, .5, .95), 
+                 data = nTor.year,
+                 control.compute = control$compute,
+                 control.predictor = control$predictor)
+TM = model$summary.fixed$mean[2]
+TL =  model$summary.fixed$'0.05quant'[2]
+TH =  model$summary.fixed$'0.95quant'[2]
+(exp(TM) - 1) * 100
+(exp(TL) - 1) * 100
+(exp(TH) - 1) * 100
+```
+
+Nonlinear trend
+```{r}
+formula = nT ~ Year + f(Year2, model = "rw2")
+model = inla(formula = formula, 
+                     family = "nbinomial", 
+                     quantiles = c(.05, .5, .95), 
+                     data = nTor.year,
+                     control.compute = control$compute,
+                     control.predictor = control$predictor)
+out = data.frame(Year = nTor.year$Year,
+                 QL = model$summary.fitted.values$"0.05quant",
+                 QM = model$summary.fitted.values$"0.5quant",
+                 QH = model$summary.fitted.values$"0.95quant",
+                 nT = nTor.year$nT,
+                 ST = AB)
+p2IL = ggplot(out, aes(x = Year, y = QM)) +
+  geom_line(color = 'blue') +
+  geom_ribbon(aes(x = Year, ymax = QH, ymin = QL), color = "gray", alpha = .25) +
+  geom_point(aes(x = Year, y = nT)) +
+  ylab("Number of EF1+ Tornadoes") +
+  theme_bw()
+```
+
+Spatial neighborhood definition as an inla graph
+```{r}
+nb = poly2nb(spdf)
+nb2INLA("tornb.inla", nb)
+tornb.inla = inla.read.graph("tornb.inla")
+```
+
+Model with spatial term. Determine the model that gives lowest DIC. Then compare with same model without the spatial term.
+```{r}
+formula = nT ~ f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+                Ldensity + Ldensity:I(Year - 1991) +
+                f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+Model diagnostics
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+brier.score(popNtor[["nT"]], model[["summary.fitted.values"]])
+```
+
+Model w/out spatial term
+```{r}
+formula0 = nT ~ Ldensity + Ldensity:I(Year - 1991) + 
+                f(Year2, model = "iid")
+model0 = inla(formula = formula0, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model0)
+```
+
+```{r}
+spdf$RandomMean = model$summary.random$ID$mean
+spdf$RandomQ50 = model$summary.random$ID$'0.5quant'
+spdf$sd = model$summary.random$ID$sd
+df = model$summary.random$ID
+names(df) = c("ID", "mean", "sd", "QL", "QM", "QH", "mode", "kld")
+df$QL = (exp(df$QL) - 1) * 100
+df$QM = (exp(df$QM) - 1) * 100
+df$QH = (exp(df$QH) - 1) * 100
+df$Sig = sign(df$QL) == sign(df$QH)
+table(df$Sig)
+spdf$Sig = df$Sig
+```
+
+```{r}
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[5] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+p3IL = ggplotSpdata(spdf, "RandomQ50", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Tornado Occurrence\n[% of State Avg]", 
+            low = muted("blue"), mid = "white", high = muted("red"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+  geom_polygon(data = borders2.df[borders2.df$newfield > 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("red"), size = 2) +
+  geom_polygon(data = borders2.df[borders2.df$newfield < 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("blue"), size = 2) +
+  geom_text(data = df3[df3$Sig,], 
+              aes(x = long, y = lat, group = NULL, label = round(newfield)), 
+              vjust = .5, size = 3, color = 'black')
+```
+
+```{r}
+Elev.data = over(countiesun.sp, Elev1, returnList = TRUE)
+Elev.df = data.frame(county = rep(county, sapply(Elev.data, nrow)),
+                     Elev = unlist(Elev.data), 
+                     ID = rep(spdf$ID, sapply(Elev.data, nrow)),
+                     stringsAsFactors = FALSE)
+t.test(Elev.df$Elev, conf.level = .9)
+CE.df = Elev.df %>%
+  group_by(ID) %>%
+  summarize(elev = mean(Elev, na.rm = TRUE),
+            elevS = sd(Elev, na.rm = TRUE),
+            elevK = kurtosis(Elev, na.rm = TRUE),
+            elevCV = elevS/elev)
+all(spdf$ID == CE.df$ID)
+spdf@data[colnames(CE.df)] = CE.df
+popNtor2 = merge(popNtor, CE.df, by = "ID")
+cor.test(spdf$nT, spdf$elevS, conf.level = .9)
+range(CE.df$elevS)
+```
+
+```{r}
+formula = nT ~ elevS +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + 
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor2,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+```{r}
+p4IL = ggplotmargin(model, type = "fixed", effect = "elevS", xlab = "") +  
+  xlab(expression("Elevation S.D. Coefficient"~"["*m^{-1}*"]"))
+```
+
+```{r}
+popNtor3 = merge(popNtor2, cwa.df, by = "county")
+formula = nT ~ cwa +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + 
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+### Mississippi
+
+Borders
+```{r}
+FP = 28
+AB = "MS"
+ST.sp = US.sp[US.sp$STATEFP == FP, ]
+nrow(ST.sp)
+county = paste(ST.sp$STATEFP, ST.sp$COUNTYFP, sep = "")
+countiesun.sp = geometry(spChFIDs(ST.sp, county)) 
+counties.sp = spTransform(countiesun.sp, CRS(proj4string(TornL)))
+rgeos::gArea(counties.sp) / 10^6
+```
+
+Elevation
+```{r}
+Elev1 = as(crop(Elev, extent(countiesun.sp)), "SpatialGridDataFrame")
+proj4string(Elev1) = proj4string(countiesun.sp) #same projection, different datum & ellipsoid
+```
+
+CWA
+```{r}
+cwa.df = data.frame(county = CWA$V7[CWA$V7 %in% county], 
+                    cwa = CWA$V3[CWA$V7 %in% county])
+```
+
+Population
+```{r}
+pop0 = subset(pop0a, state_fips == FP)
+pop0$pop2013 = pop0$pop2012
+pop0$pop2013[1]
+pop0$county = as.character(pop0$fips)
+pop1 = pop0[-1, -(1:10)]
+Pop.df = melt(pop1, id.vars = "county")
+Pop.df$Year = as.numeric(substring(Pop.df$variable, first = 4, last = 7))
+names(Pop.df)[3:4] = c("pop", "Year")
+Pop.df$lpop = log10(Pop.df$pop)
+Pop.df$ID = match(Pop.df$county, county) #generate spatial ID
+Pop.df = Pop.df[order(Pop.df$ID), ]
+PC = Pop.df %>%
+  group_by(ID) %>%
+  summarize(Change = (pop[Year == max(Year)] - pop[Year == min(Year)])/pop[Year == max(Year)] * 100)
+PC.df = as.data.frame(PC)
+row.names(PC.df) = county
+spdf = SpatialPolygonsDataFrame(counties.sp, PC.df)
+spdf$Name = ST.sp$NAME
+area = rgeos::gArea(counties.sp, byid = TRUE)
+spdf$area = area
+poplatest = subset(Pop.df, Year == max(Year))
+spdf$pop = poplatest$pop
+spdf$Lpop = log10(spdf$pop)
+spdf$density = spdf$pop/spdf$area * 10^6
+spdf$Ldensity = log10(spdf$density)
+```
+
+Tornadoes
+```{r}
+ct = over(counties.sp, TornL2, returnList = TRUE)
+names(ct) = county
+nT = sapply(ct, function(x) nrow(x))
+Nyears = diff(range(TornL2$Year)) + 1
+nTor.df = data.frame(state = AB, county = county, Nyears =  Nyears,
+                     nT = nT, area = area/1000000, 
+                     rate = nT/area * 10^6 * 10000 / Nyears,
+                     stringsAsFactors = FALSE, ID = 1:length(county))
+spdf$state = AB
+spdf$county = county
+spdf$Nyears = nTor.df$Nyears
+spdf$nT = nTor.df$nT
+spdf$area = nTor.df$area
+spdf$rate = nTor.df$rate
+TracksAll.df = ldply(ct, data.frame)
+colnames(TracksAll.df)[1] = "county"
+cor.test(spdf$nT, spdf$area, conf.level = .9)
+cor.test(spdf$nT, spdf$pop, conf.level = .9)
+nTor.year = TracksAll.df %>%
+  filter(!duplicated(SeqID)) %>%
+  group_by(Year) %>%
+  summarize(nT = n())
+nTor.year = as.data.frame(nTor.year)
+nTor.year$Year2 = nTor.year$Year
+sum(nTor.year$nT)
+nTor.day0 = ddply(TracksAll.df, .(county, Year), summarize, 
+                  nT = length(county), 
+                  nTd = length(unique(Date)), .drop = FALSE)
+nTor.day = merge(nTor.df[c("state", "county", "area", "ID")],
+                 nTor.day0)
+popNtor = merge(Pop.df, nTor.day, all = FALSE)
+popNtor$density = with(popNtor, pop/area)
+popNtor$Ldensity = log2(popNtor$density)
+popNtor$Year2 = popNtor$Year
+```
+
+Raw counts and tracks
+```{r}
+p4s = "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=32.8 +lon_0=-89.7 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+spdf = spTransform(spdf, CRS(p4s))
+crq = wes.palette(name = "Zissou", type = "continuous")
+p1MS = plotTorn(x = spdf, tracks = TracksAll.df) +
+         scale_fill_gradientn("EF1+\nTornado Reports\n(1970-2013)", 
+                              colours = crq(10))
+```
+
+Linear Trend (%/yr)
+```{r}
+formula = nT ~ Year
+model = inla(formula = formula, 
+                 family = "nbinomial", 
+                 quantiles = c(.05, .5, .95), 
+                 data = nTor.year,
+                 control.compute = control$compute,
+                 control.predictor = control$predictor)
+TM = model$summary.fixed$mean[2]
+TL =  model$summary.fixed$'0.05quant'[2]
+TH =  model$summary.fixed$'0.95quant'[2]
+(exp(TM) - 1) * 100
+(exp(TL) - 1) * 100
+(exp(TH) - 1) * 100
+```
+
+Nonlinear trend
+```{r}
+formula = nT ~ Year + f(Year2, model = "rw2")
+model = inla(formula = formula, 
+                     family = "nbinomial", 
+                     quantiles = c(.05, .5, .95), 
+                     data = nTor.year,
+                     control.compute = control$compute,
+                     control.predictor = control$predictor)
+out = data.frame(Year = nTor.year$Year,
+                 QL = model$summary.fitted.values$"0.05quant",
+                 QM = model$summary.fitted.values$"0.5quant",
+                 QH = model$summary.fitted.values$"0.95quant",
+                 nT = nTor.year$nT,
+                 ST = AB)
+p2MS = ggplot(out, aes(x = Year, y = QM)) +
+  geom_line(color = 'blue') +
+  geom_ribbon(aes(x = Year, ymax = QH, ymin = QL), color = "gray", alpha = .25) +
+  geom_point(aes(x = Year, y = nT)) +
+  ylab("Number of EF1+ Tornadoes") +
+  theme_bw()
+```
+
+Spatial neighborhood definition as an inla graph
+```{r}
+nb = poly2nb(spdf)
+nb2INLA("tornb.inla", nb)
+tornb.inla = inla.read.graph("tornb.inla")
+```
+
+Model with spatial term. Determine the model that gives lowest DIC. Then compare with same model without the spatial term.
+```{r}
+formula = nT ~ f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+                Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+                f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+Model diagnostics
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+brier.score(popNtor[["nT"]], model[["summary.fitted.values"]])
+```
+
+Model w/out spatial term
+```{r}
+formula0 = nT ~ Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+                f(Year2, model = "iid")
+model0 = inla(formula = formula0, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model0)
+```
+
+```{r}
+spdf$RandomMean = model$summary.random$ID$mean
+spdf$RandomQ50 = model$summary.random$ID$'0.5quant'
+spdf$sd = model$summary.random$ID$sd
+df = model$summary.random$ID
+names(df) = c("ID", "mean", "sd", "QL", "QM", "QH", "mode", "kld")
+df$QL = (exp(df$QL) - 1) * 100
+df$QM = (exp(df$QM) - 1) * 100
+df$QH = (exp(df$QH) - 1) * 100
+df$Sig = sign(df$QL) == sign(df$QH)
+table(df$Sig)
+spdf$Sig = df$Sig
+```
+
+```{r}
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[5] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+p3MS = ggplotSpdata(spdf, "RandomQ50", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Tornado Occurrence\n[% of State Avg]", 
+            low = muted("blue"), mid = "white", high = muted("red"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+  geom_polygon(data = borders2.df[borders2.df$newfield > 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("red"), size = 2) +
+  geom_polygon(data = borders2.df[borders2.df$newfield < 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("blue"), size = 2) +
+  geom_text(data = df3[df3$Sig,], 
+              aes(x = long, y = lat, group = NULL, label = round(newfield)), 
+              vjust = .5, size = 3, color = 'black')
+```
+
+```{r}
+Elev.data = over(countiesun.sp, Elev1, returnList = TRUE)
+Elev.df = data.frame(county = rep(county, sapply(Elev.data, nrow)),
+                     Elev = unlist(Elev.data), 
+                     ID = rep(spdf$ID, sapply(Elev.data, nrow)),
+                     stringsAsFactors = FALSE)
+t.test(Elev.df$Elev, conf.level = .9)
+CE.df = Elev.df %>%
+  group_by(ID) %>%
+  summarize(elev = mean(Elev, na.rm = TRUE),
+            elevS = sd(Elev, na.rm = TRUE),
+            elevK = kurtosis(Elev, na.rm = TRUE),
+            elevCV = elevS/elev)
+all(spdf$ID == CE.df$ID)
+spdf@data[colnames(CE.df)] = CE.df
+popNtor2 = merge(popNtor, CE.df, by = "ID")
+cor.test(spdf$nT, spdf$elevS, conf.level = .9)
+range(CE.df$elevS)
+```
+
+```{r}
+formula = nT ~ elevS +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor2,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+```{r}
+p4MS = ggplotmargin(model, type = "fixed", effect = "elevS", xlab = "") +  
+  xlab(expression("Elevation S.D. Coefficient"~"["*m^{-1}*"]"))
+```
+
+```{r}
+cwa.df$JAN = cwa.df$cwa == "JAN"
+cwa.df$MOB = cwa.df$cwa == "MOB"
+popNtor3 = merge(popNtor2, cwa.df, by = "county")
+formula = nT ~ elevS + cwa +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+
+formula = nT ~ elevS + JAN +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+
+formula = nT ~ elevS + MOB +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+
+```
+
+### South Dakota
+
+Borders
+```{r}
+FP = 46
+AB = "SD"
+ST.sp = US.sp[US.sp$STATEFP == FP, ]
+nrow(ST.sp)
+county = paste(ST.sp$STATEFP, ST.sp$COUNTYFP, sep = "")
+countiesun.sp = geometry(spChFIDs(ST.sp, county)) 
+counties.sp = spTransform(countiesun.sp, CRS(proj4string(TornL)))
+rgeos::gArea(counties.sp) / 10^6
+```
+
+Elevation
+```{r}
+ElevA = Elev
+ElevB = raster("15-B.tif")
+Elev = merge(ElevA, ElevB)
+Elev1 = as(crop(Elev, extent(countiesun.sp)), "SpatialGridDataFrame")
+proj4string(Elev1) = proj4string(countiesun.sp) #same projection, different datum & ellipsoid
+```
+
+CWA
+```{r}
+cwa.df = data.frame(county = CWA$V7[CWA$V7 %in% county], 
+                    cwa = CWA$V3[CWA$V7 %in% county])
+```
+
+Population
+```{r}
+pop0 = subset(pop0a, state_fips == FP)
+pop0$pop2013 = pop0$pop2012
+pop0$pop2013[1]
+pop0$county = as.character(pop0$fips)
+pop1 = pop0[-1, -(1:10)]
+Pop.df = melt(pop1, id.vars = "county")
+Pop.df$Year = as.numeric(substring(Pop.df$variable, first = 4, last = 7))
+names(Pop.df)[3:4] = c("pop", "Year")
+Pop.df$lpop = log10(Pop.df$pop)
+Pop.df$ID = match(Pop.df$county, county) #generate spatial ID
+Pop.df = Pop.df[order(Pop.df$ID), ]
+PC = Pop.df %>%
+  group_by(ID) %>%
+  summarize(Change = (pop[Year == max(Year)] - pop[Year == min(Year)])/pop[Year == max(Year)] * 100)
+PC.df = as.data.frame(PC)
+row.names(PC.df) = county
+spdf = SpatialPolygonsDataFrame(counties.sp, PC.df)
+spdf$Name = ST.sp$NAME
+area = rgeos::gArea(counties.sp, byid = TRUE)
+spdf$area = area
+poplatest = subset(Pop.df, Year == max(Year))
+spdf$pop = poplatest$pop
+spdf$Lpop = log10(spdf$pop)
+spdf$density = spdf$pop/spdf$area * 10^6
+spdf$Ldensity = log10(spdf$density)
+```
+
+Tornadoes
+```{r}
+ct = over(counties.sp, TornL2, returnList = TRUE)
+names(ct) = county
+nT = sapply(ct, function(x) nrow(x))
+Nyears = diff(range(TornL2$Year)) + 1
+nTor.df = data.frame(state = AB, county = county, Nyears =  Nyears,
+                     nT = nT, area = area/1000000, 
+                     rate = nT/area * 10^6 * 10000 / Nyears,
+                     stringsAsFactors = FALSE, ID = 1:length(county))
+spdf$state = AB
+spdf$county = county
+spdf$Nyears = nTor.df$Nyears
+spdf$nT = nTor.df$nT
+spdf$area = nTor.df$area
+spdf$rate = nTor.df$rate
+TracksAll.df = ldply(ct, data.frame)
+colnames(TracksAll.df)[1] = "county"
+cor.test(spdf$nT, spdf$area, conf.level = .9)
+cor.test(spdf$nT, spdf$pop, conf.level = .9)
+nTor.year = TracksAll.df %>%
+  filter(!duplicated(SeqID)) %>%
+  group_by(Year) %>%
+  summarize(nT = n())
+nTor.year = as.data.frame(nTor.year)
+nTor.year$Year2 = nTor.year$Year
+sum(nTor.year$nT)
+nTor.day0 = ddply(TracksAll.df, .(county, Year), summarize, 
+                  nT = length(county), 
+                  nTd = length(unique(Date)), .drop = FALSE)
+nTor.day = merge(nTor.df[c("state", "county", "area", "ID")],
+                 nTor.day0)
+popNtor = merge(Pop.df, nTor.day, all = FALSE)
+popNtor$density = with(popNtor, pop/area)
+popNtor$Ldensity = log2(popNtor$density)
+popNtor$Year2 = popNtor$Year
+```
+
+Raw counts and tracks
+```{r}
+p4s = "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=44.43 +lon_0=-100.2 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+spdf = spTransform(spdf, CRS(p4s))
+crq = wes.palette(name = "Zissou", type = "continuous")
+p1SD = plotTorn(x = spdf, tracks = TracksAll.df) +
+         scale_fill_gradientn("EF1+\nTornado Reports\n(1970-2013)", 
+                              colours = crq(10))
+```
+
+Linear Trend (%/yr)
+```{r}
+formula = nT ~ Year
+model = inla(formula = formula, 
+                 family = "nbinomial", 
+                 quantiles = c(.05, .5, .95), 
+                 data = nTor.year,
+                 control.compute = control$compute,
+                 control.predictor = control$predictor)
+TM = model$summary.fixed$mean[2]
+TL =  model$summary.fixed$'0.05quant'[2]
+TH =  model$summary.fixed$'0.95quant'[2]
+(exp(TM) - 1) * 100
+(exp(TL) - 1) * 100
+(exp(TH) - 1) * 100
+```
+
+Nonlinear trend
+```{r}
+formula = nT ~ Year + f(Year2, model = "rw2")
+model = inla(formula = formula, 
+                     family = "nbinomial", 
+                     quantiles = c(.05, .5, .95), 
+                     data = nTor.year,
+                     control.compute = control$compute,
+                     control.predictor = control$predictor)
+out = data.frame(Year = nTor.year$Year,
+                 QL = model$summary.fitted.values$"0.05quant",
+                 QM = model$summary.fitted.values$"0.5quant",
+                 QH = model$summary.fitted.values$"0.95quant",
+                 nT = nTor.year$nT,
+                 ST = AB)
+p2SD = ggplot(out, aes(x = Year, y = QM)) +
+  geom_line(color = 'blue') +
+  geom_ribbon(aes(x = Year, ymax = QH, ymin = QL), color = "gray", alpha = .25) +
+  geom_point(aes(x = Year, y = nT)) +
+  ylab("Number of EF1+ Tornadoes") +
+  theme_bw()
+```
+
+Spatial neighborhood definition as an inla graph
+```{r}
+nb = poly2nb(spdf)
+nb2INLA("tornb.inla", nb)
+tornb.inla = inla.read.graph("tornb.inla")
+```
+
+Model with spatial term. Determine the model that gives lowest DIC. Then compare with same model without the spatial term.
+```{r}
+formula = nT ~ f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+                Ldensity + I(Year - 1991) +
+                f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+Model diagnostics
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+brier.score(popNtor[["nT"]], model[["summary.fitted.values"]])
+```
+
+Model w/out spatial term
+```{r}
+formula0 = nT ~ Ldensity + I(Year - 1991) +
+                f(Year2, model = "iid")
+model0 = inla(formula = formula0, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model0)
+```
+
+```{r}
+spdf$RandomMean = model$summary.random$ID$mean
+spdf$RandomQ50 = model$summary.random$ID$'0.5quant'
+spdf$sd = model$summary.random$ID$sd
+df = model$summary.random$ID
+names(df) = c("ID", "mean", "sd", "QL", "QM", "QH", "mode", "kld")
+df$QL = (exp(df$QL) - 1) * 100
+df$QM = (exp(df$QM) - 1) * 100
+df$QH = (exp(df$QH) - 1) * 100
+df$Sig = sign(df$QL) == sign(df$QH)
+table(df$Sig)
+spdf$Sig = df$Sig
+```
+
+```{r}
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[5] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+p3SD = ggplotSpdata(spdf, "RandomQ50", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Tornado Occurrence\n[% of State Avg]", 
+            low = muted("blue"), mid = "white", high = muted("red"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+  geom_polygon(data = borders2.df[borders2.df$newfield > 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("red"), size = 2) +
+  geom_polygon(data = borders2.df[borders2.df$newfield < 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("blue"), size = 2) +
+  geom_text(data = df3[df3$Sig,], 
+              aes(x = long, y = lat, group = NULL, label = round(newfield)), 
+              vjust = .5, size = 3, color = 'black')
+```
+
+```{r}
+Elev.data = over(countiesun.sp, Elev1, returnList = TRUE)
+Elev.df = data.frame(county = rep(county, sapply(Elev.data, nrow)),
+                     Elev = unlist(Elev.data), 
+                     ID = rep(spdf$ID, sapply(Elev.data, nrow)),
+                     stringsAsFactors = FALSE)
+t.test(Elev.df$Elev, conf.level = .9)
+CE.df = Elev.df %>%
+  group_by(ID) %>%
+  summarize(elev = mean(Elev, na.rm = TRUE),
+            elevS = sd(Elev, na.rm = TRUE),
+            elevK = kurtosis(Elev, na.rm = TRUE),
+            elevCV = elevS/elev)
+all(spdf$ID == CE.df$ID)
+spdf@data[colnames(CE.df)] = CE.df
+popNtor2 = merge(popNtor, CE.df, by = "ID")
+cor.test(spdf$nT, spdf$elevS, conf.level = .9)
+range(spdf$elevS)
+```
+
+```{r}
+formula = nT ~ elevS +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor2,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+```{r}
+p4SD = ggplotmargin(model, type = "fixed", effect = "elevS", xlab = "") +  
+  xlab(expression("Elevation S.D. Coefficient"~"["*m^{-1}*"]"))
+```
+
+```{r}
+table(cwa.df$cwa)
+cwa.df$ABR = cwa.df$cwa == "ABR"
+cwa.df$FSD = cwa.df$cwa == "FSD"
+cwa.df$UNR = cwa.df$cwa == "UNR"
+popNtor3 = merge(popNtor2, cwa.df, by = "county")
+formula = nT ~ elevS + cwa +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + I(Year - 1991) + 
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+
+formula = nT ~ elevS + UNR +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + I(Year - 1991) + 
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+### Ohio
+
+Borders
+```{r}
+FP = 39
+AB = "OH"
+ST.sp = US.sp[US.sp$STATEFP == FP, ]
+nrow(ST.sp)
+county = paste(ST.sp$STATEFP, ST.sp$COUNTYFP, sep = "")
+countiesun.sp = geometry(spChFIDs(ST.sp, county)) 
+counties.sp = spTransform(countiesun.sp, CRS(proj4string(TornL)))
+rgeos::gArea(counties.sp) / 10^6
+```
+
+Elevation
+```{r}
+Elev1 = as(crop(Elev, extent(countiesun.sp)), "SpatialGridDataFrame")
+proj4string(Elev1) = proj4string(countiesun.sp) #same projection, different datum & ellipsoid
+```
+
+CWA
+```{r}
+cwa.df = data.frame(county = CWA$V7[CWA$V7 %in% county], 
+                    cwa = CWA$V3[CWA$V7 %in% county])
+```
+
+Population
+```{r}
+pop0 = subset(pop0a, state_fips == FP)
+pop0$pop2013 = pop0$pop2012
+pop0$pop2013[1]
+pop0$county = as.character(pop0$fips)
+pop1 = pop0[-1, -(1:10)]
+Pop.df = melt(pop1, id.vars = "county")
+Pop.df$Year = as.numeric(substring(Pop.df$variable, first = 4, last = 7))
+names(Pop.df)[3:4] = c("pop", "Year")
+Pop.df$lpop = log10(Pop.df$pop)
+Pop.df$ID = match(Pop.df$county, county) #generate spatial ID
+Pop.df = Pop.df[order(Pop.df$ID), ]
+PC = Pop.df %>%
+  group_by(ID) %>%
+  summarize(Change = (pop[Year == max(Year)] - pop[Year == min(Year)])/pop[Year == max(Year)] * 100)
+PC.df = as.data.frame(PC)
+row.names(PC.df) = county
+spdf = SpatialPolygonsDataFrame(counties.sp, PC.df)
+spdf$Name = ST.sp$NAME
+area = rgeos::gArea(counties.sp, byid = TRUE)
+spdf$area = area
+poplatest = subset(Pop.df, Year == max(Year))
+spdf$pop = poplatest$pop
+spdf$Lpop = log10(spdf$pop)
+spdf$density = spdf$pop/spdf$area * 10^6
+spdf$Ldensity = log10(spdf$density)
+```
+
+Tornadoes
+```{r}
+ct = over(counties.sp, TornL2, returnList = TRUE)
+names(ct) = county
+nT = sapply(ct, function(x) nrow(x))
+Nyears = diff(range(TornL2$Year)) + 1
+nTor.df = data.frame(state = AB, county = county, Nyears =  Nyears,
+                     nT = nT, area = area/1000000, 
+                     rate = nT/area * 10^6 * 10000 / Nyears,
+                     stringsAsFactors = FALSE, ID = 1:length(county))
+spdf$state = AB
+spdf$county = county
+spdf$Nyears = nTor.df$Nyears
+spdf$nT = nTor.df$nT
+spdf$area = nTor.df$area
+spdf$rate = nTor.df$rate
+TracksAll.df = ldply(ct, data.frame)
+colnames(TracksAll.df)[1] = "county"
+cor.test(spdf$nT, spdf$area, conf.level = .9)
+cor.test(spdf$nT, spdf$pop, conf.level = .9)
+nTor.year = TracksAll.df %>%
+  filter(!duplicated(SeqID)) %>%
+  group_by(Year) %>%
+  summarize(nT = n())
+nTor.year = as.data.frame(nTor.year)
+nTor.year$Year2 = nTor.year$Year
+sum(nTor.year$nT)
+nTor.day0 = ddply(TracksAll.df, .(county, Year), summarize, 
+                  nT = length(county), 
+                  nTd = length(unique(Date)), .drop = FALSE)
+nTor.day = merge(nTor.df[c("state", "county", "area", "ID")],
+                 nTor.day0)
+popNtor = merge(Pop.df, nTor.day, all = FALSE)
+popNtor$density = with(popNtor, pop/area)
+popNtor$Ldensity = log2(popNtor$density)
+popNtor$Year2 = popNtor$Year
+```
+
+Raw counts and tracks
+```{r}
+p4s = "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40.28 +lon_0=-82.79 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +ellps=GRS80 +towgs84=0,0,0"
+spdf = spTransform(spdf, CRS(p4s))
+crq = wes.palette(name = "Zissou", type = "continuous")
+p1OH = plotTorn(x = spdf, tracks = TracksAll.df) +
+         scale_fill_gradientn("EF1+\nTornado Reports\n(1970-2013)", 
+                              colours = crq(10))
+```
+
+Linear Trend (%/yr)
+```{r}
+formula = nT ~ Year
+model = inla(formula = formula, 
+                 family = "nbinomial", 
+                 quantiles = c(.05, .5, .95), 
+                 data = nTor.year,
+                 control.compute = control$compute,
+                 control.predictor = control$predictor)
+TM = model$summary.fixed$mean[2]
+TL =  model$summary.fixed$'0.05quant'[2]
+TH =  model$summary.fixed$'0.95quant'[2]
+(exp(TM) - 1) * 100
+(exp(TL) - 1) * 100
+(exp(TH) - 1) * 100
+```
+
+Nonlinear trend
+```{r}
+formula = nT ~ Year + f(Year2, model = "rw2")
+model = inla(formula = formula, 
+                     family = "nbinomial", 
+                     quantiles = c(.05, .5, .95), 
+                     data = nTor.year,
+                     control.compute = control$compute,
+                     control.predictor = control$predictor)
+out = data.frame(Year = nTor.year$Year,
+                 QL = model$summary.fitted.values$"0.05quant",
+                 QM = model$summary.fitted.values$"0.5quant",
+                 QH = model$summary.fitted.values$"0.95quant",
+                 nT = nTor.year$nT,
+                 ST = AB)
+p2OH = ggplot(out, aes(x = Year, y = QM)) +
+  geom_line(color = 'blue') +
+  geom_ribbon(aes(x = Year, ymax = QH, ymin = QL), color = "gray", alpha = .25) +
+  geom_point(aes(x = Year, y = nT)) +
+  ylab("Number of EF1+ Tornadoes") +
+  theme_bw()
+```
+
+Spatial neighborhood definition as an inla graph
+```{r}
+nb = poly2nb(spdf)
+nb2INLA("tornb.inla", nb)
+tornb.inla = inla.read.graph("tornb.inla")
+```
+
+Model with spatial term. Determine the model that gives lowest DIC. Then compare with same model without the spatial term.
+```{r}
+formula = nT ~ f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+                Ldensity + Ldensity:I(Year - 1991) +
+                f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+Model diagnostics
+```{r}
+modPIT = model$cpo$pit - runif(length(model$cpo$cpo)) * model$cpo$cpo
+goftest::ad.test(modPIT)
+-mean(log(model$cpo$cpo))
+cor.test(popNtor$nT, model$summary.fitted.values$mean, conf.level = .9)
+brier.score(popNtor[["nT"]], model[["summary.fitted.values"]])
+```
+
+Model w/out spatial term
+```{r}
+formula0 = nT ~ Ldensity + Ldensity:I(Year - 1991) +
+                f(Year2, model = "iid")
+model0 = inla(formula = formula0, family = "nbinomial", E = area/2000,
+                 data = popNtor,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model0)
+```
+
+```{r}
+spdf$RandomMean = model$summary.random$ID$mean
+spdf$RandomQ50 = model$summary.random$ID$'0.5quant'
+spdf$sd = model$summary.random$ID$sd
+df = model$summary.random$ID
+names(df) = c("ID", "mean", "sd", "QL", "QM", "QH", "mode", "kld")
+df$QL = (exp(df$QL) - 1) * 100
+df$QM = (exp(df$QM) - 1) * 100
+df$QH = (exp(df$QH) - 1) * 100
+df$Sig = sign(df$QL) == sign(df$QH)
+table(df$Sig)
+spdf$Sig = df$Sig
+```
+
+```{r}
+CRS0 = CRS("+proj=longlat +datum=WGS84")
+bc = getBordersAndCenters(spdf, CRS0)
+df2 = bc$centers
+df3 = cbind(df, df2)
+names(df3)[5] = 'newfield'
+borders.df = merge(bc$borders, df3[c("county", "newfield", "Sig")], by = "county")
+borders2.df = borders.df[borders.df$Sig, ]
+p3OH = ggplotSpdata(spdf, "RandomQ50", tfun = function(x) round((exp(x) - 1) * 100)) +
+        scale_fill_gradient2("Tornado Occurrence\n[% of State Avg]", 
+            low = muted("blue"), mid = "white", high = muted("red"),
+            midpoint = 0, space = "rgb", na.value = "grey50", guide = "colourbar") +
+  geom_polygon(data = borders2.df[borders2.df$newfield > 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("red"), size = 2) +
+  geom_polygon(data = borders2.df[borders2.df$newfield < 0, ],
+               aes(x = long, y = lat, group = group, fill = newfield),
+               color = muted("blue"), size = 2) +
+  geom_text(data = df3[df3$Sig,], 
+              aes(x = long, y = lat, group = NULL, label = round(newfield)), 
+              vjust = .5, size = 3, color = 'black')
+```
+
+```{r}
+Elev.data = over(countiesun.sp, Elev1, returnList = TRUE)
+Elev.df = data.frame(county = rep(county, sapply(Elev.data, nrow)),
+                     Elev = unlist(Elev.data), 
+                     ID = rep(spdf$ID, sapply(Elev.data, nrow)),
+                     stringsAsFactors = FALSE)
+t.test(Elev.df$Elev, conf.level = .9)
+CE.df = Elev.df %>%
+  group_by(ID) %>%
+  summarize(elev = mean(Elev, na.rm = TRUE),
+            elevS = sd(Elev, na.rm = TRUE),
+            elevK = kurtosis(Elev, na.rm = TRUE),
+            elevCV = elevS/elev)
+all(spdf$ID == CE.df$ID)
+spdf@data[colnames(CE.df)] = CE.df
+popNtor2 = merge(popNtor, CE.df, by = "ID")
+cor.test(spdf$nT, spdf$elevS, conf.level = .9)
+```
+
+```{r}
+formula = nT ~ elevS +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + Ldensity:I(Year - 1991) +
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor2,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+```{r}
+p4OH = ggplotmargin(model, type = "fixed", effect = "elevS", xlab = "") +  
+  xlab(expression("Elevation S.D. Coefficient"~"["*m^{-1}*"]"))
+```
+
+```{r}
+popNtor3 = merge(popNtor2, cwa.df, by = "county")
+formula = nT ~ cwa +
+               f(ID, model = "besag", graph = tornb.inla, constr = TRUE) + 
+               Ldensity + I(Year - 1991) + 
+               f(Year2, model = "iid")
+model = inla(formula = formula, family = "nbinomial", E = area/2000,
+                 data = popNtor3,
+                 quantiles = c(.05, .5, .95),
+                 control.compute = control$compute,
+                 control.predictor = control$predictor,
+                 control.results = control$results,
+                 control.family = control$family
+                 )
+summary(model)
+```
+
+### Four-panel plots
+
+```{r Fig10, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+source("multiplot.txt")
+mat = matrix(1:4, nrow = 2, byrow = TRUE)
+p1IL = p1IL + ggtitle("a Illinois") + theme(plot.title = element_text(hjust = 0, size = 15))
+p1MS = p1MS + ggtitle("b Mississippi") + theme(plot.title = element_text(hjust = 0, size = 15))
+p1SD = p1SD + ggtitle("c South Dakota") + theme(plot.title = element_text(hjust = 0, size = 15))
+p1OH = p1OH + ggtitle("d Ohio") + theme(plot.title = element_text(hjust = 0, size = 15))
+multiplot(p1IL, p1MS, p1SD, p1OH, layout = mat)
+```
+
+```{r Fig11, dev=c('png','pdf'), fig.height=7, fig.width=7, fig.path='figure/', fig.keep='all'}
+p2IL = p2IL + ggtitle("a Illinois") + theme(plot.title = element_text(hjust = 0, size = 15))
+p2MS = p2MS + ggtitle("b Mississippi") + theme(plot.title = element_text(hjust = 0, size = 15))
+p2SD = p2SD + ggtitle("c South Dakota") + theme(plot.title = element_text(hjust = 0, size = 15))
+p2OH = p2OH + ggtitle("d Ohio") + theme(plot.title = element_text(hjust = 0, size = 15))
+multiplot(p2IL, p2MS, p2SD, p2OH, layout = mat)
+```
+
+```{r Fig12, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
+p3IL = p3IL + ggtitle("a Illinois") + theme(plot.title = element_text(hjust = 0, size = 15))
+p3MS = p3MS + ggtitle("b Mississippi") + theme(plot.title = element_text(hjust = 0, size = 15))
+p3SD = p3SD + ggtitle("c South Dakota") + theme(plot.title = element_text(hjust = 0, size = 15))
+p3OH = p3OH + ggtitle("d Ohio") + theme(plot.title = element_text(hjust = 0, size = 15))
+multiplot(p3IL, p3MS, p3SD, p3OH, layout = mat)
+```
+
+```{r Fig13, dev=c('png','pdf'), fig.height=7, fig.width=7, fig.path='figure/', fig.keep='all'}
+p4IL = p4IL + ggtitle("a Illinois") + theme(plot.title = element_text(hjust = 0, size = 15))
+p4MS = p4MS + ggtitle("b Mississippi") + theme(plot.title = element_text(hjust = 0, size = 15))
+p4SD = p4SD + ggtitle("c South Dakota") + theme(plot.title = element_text(hjust = 0, size = 15))
+p4OH = p4OH + ggtitle("d Ohio") + theme(plot.title = element_text(hjust = 0, size = 15))
+multiplot(p4IL, p4MS, p4SD, p4OH, layout = mat)
+```
