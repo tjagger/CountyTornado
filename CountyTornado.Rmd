@@ -18,13 +18,6 @@ slibrary(wesanderson)
 slibrary(INLA)
 #inla.update(testing = TRUE)
 #inla.version()
-useDrop <- function(x, use.fun = source, ...){
-                    tf <- tempfile()
-                    tmp <- GET(x)
-                    stop_for_status(tmp)
-                    writeBin(content(tmp, type = "raw"), tf)
-                    use.fun(tf, ...)
-                    }
 source("CountyStatisticsSupport.R")
 slibrary(dplyr)
 ```
@@ -37,7 +30,6 @@ download.file("http://www.spc.noaa.gov/gis/svrgis/zipped/tornado.zip",
               "tornado.zip", mode = "wb")
 ```
 ```{r}
-
 unzip("tornado.zip",exdir="./tmp")
 TornL = changeTornDataTypes(readOGR(dsn = "./tmp", layer = "tornado", 
                                     stringsAsFactors = FALSE))
@@ -1376,7 +1368,8 @@ rgeos::gArea(counties.sp) / 10^6
 Elevation
 ```{r}
 ElevA = Elev
-ElevB = raster("15-B.tif")
+unzip("15-B.zip",exdir="./tmp")
+ElevB = raster("./tmp/15-B.tif")
 Elev = merge(ElevA, ElevB)
 Elev1 = as(crop(Elev, extent(countiesun.sp)), "SpatialGridDataFrame")
 proj4string(Elev1) = proj4string(countiesun.sp) #same projection, different datum & ellipsoid
@@ -1952,7 +1945,7 @@ summary(model)
 ### Four-panel plots
 
 ```{r Fig10, dev=c('png','pdf'), fig.height=9, fig.width=7, fig.path='figure/', fig.keep='all'}
-source("multiplot.txt")
+source("multiplot.R")
 mat = matrix(1:4, nrow = 2, byrow = TRUE)
 p1IL = p1IL + ggtitle("a Illinois") + theme(plot.title = element_text(hjust = 0, size = 15))
 p1MS = p1MS + ggtitle("b Mississippi") + theme(plot.title = element_text(hjust = 0, size = 15))
