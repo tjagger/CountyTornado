@@ -5,16 +5,6 @@ Statistical Models for Regional Tornado Studies
 
 ```{r, echo=FALSE}
 slibrary <- function(...) suppressMessages(library(...))
-slibrary(httr)
-slibrary(moments)
-slibrary(magrittr) #For Tom... needs to update dplyr
-slibrary(raster)
-slibrary(spdep)
-slibrary(splines)
-slibrary(reshape2)
-slibrary(RColorBrewer)
-slibrary(wesanderson)
-#source("http://www.math.ntnu.no/inla/givemeINLA.R")
 slibrary(INLA)
 #inla.update(testing = TRUE)
 #inla.version()
